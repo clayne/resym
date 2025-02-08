@@ -2,7 +2,7 @@ use anyhow::Result;
 use eframe::egui;
 use memory_logger::blocking::MemoryLogger;
 use resym_core::{
-    backend::{Backend, BackendCommand, PDBSlot, SymbolFilters},
+    backend::{Backend, BackendCommand, PDBSlot, SymbolFilters, TypeFilters},
     frontend::FrontendCommand,
     pdb_file::{SymbolIndex, TypeIndex},
 };
@@ -64,6 +64,7 @@ pub struct ResymApp {
     // Components used in the left-side panel
     left_panel_selected_tab: LeftPanelTab,
     type_search: TextSearchComponent,
+    type_filters: SearchFiltersComponent<TypeFilters>,
     type_list: IndexListComponent<TypeIndex>,
     selected_type_index: Option<TypeIndex>,
     symbol_search: TextSearchComponent,
@@ -165,6 +166,7 @@ impl ResymApp {
             current_mode: ResymAppMode::Idle,
             left_panel_selected_tab: LeftPanelTab::TypeSearch,
             type_search: TextSearchComponent::new(),
+            type_filters: SearchFiltersComponent::new("Search filters"),
             type_list: IndexListComponent::new(IndexListOrdering::Alphabetical),
             selected_type_index: None,
             symbol_search: TextSearchComponent::new(),
@@ -234,37 +236,53 @@ impl ResymApp {
 
                 match self.left_panel_selected_tab {
                     LeftPanelTab::TypeSearch => {
+                        let update_type_list =
+                            |search_query: &str, search_filters: &TypeFilters| {
+                                // Update filtered list if filter has changed
+                                let result = if let ResymAppMode::Comparing(..) = self.current_mode
+                                {
+                                    self.backend.send_command(BackendCommand::ListTypesMerged(
+                                        vec![
+                                            ResymPDBSlots::Main as usize,
+                                            ResymPDBSlots::Diff as usize,
+                                        ],
+                                        search_query.to_string(),
+                                        self.settings.app_settings.search_case_insensitive,
+                                        self.settings.app_settings.search_use_regex,
+                                        self.settings.app_settings.ignore_std_types,
+                                        search_filters.clone(),
+                                    ))
+                                } else {
+                                    self.backend.send_command(BackendCommand::ListTypes(
+                                        ResymPDBSlots::Main as usize,
+                                        search_query.to_string(),
+                                        self.settings.app_settings.search_case_insensitive,
+                                        self.settings.app_settings.search_use_regex,
+                                        self.settings.app_settings.ignore_std_types,
+                                        search_filters.clone(),
+                                    ))
+                                };
+                                if let Err(err) = result {
+                                    log::error!("Failed to update type filter value: {}", err);
+                                }
+                            };
+
                         // Callback run when the search query changes
                         let on_query_update = |search_query: &str| {
-                            // Update filtered list if filter has changed
-                            let result = if let ResymAppMode::Comparing(..) = self.current_mode {
-                                self.backend.send_command(BackendCommand::ListTypesMerged(
-                                    vec![
-                                        ResymPDBSlots::Main as usize,
-                                        ResymPDBSlots::Diff as usize,
-                                    ],
-                                    search_query.to_string(),
-                                    self.settings.app_settings.search_case_insensitive,
-                                    self.settings.app_settings.search_use_regex,
-                                    self.settings.app_settings.ignore_std_types,
-                                ))
-                            } else {
-                                self.backend.send_command(BackendCommand::ListTypes(
-                                    ResymPDBSlots::Main as usize,
-                                    search_query.to_string(),
-                                    self.settings.app_settings.search_case_insensitive,
-                                    self.settings.app_settings.search_use_regex,
-                                    self.settings.app_settings.ignore_std_types,
-                                ))
-                            };
-                            if let Err(err) = result {
-                                log::error!("Failed to update type filter value: {}", err);
-                            }
+                            let search_filters = self.type_filters.filters();
+                            update_type_list(search_query, search_filters);
                         };
 
                         // Update the type search bar
                         ui.label("Search");
                         self.type_search.update(ui, &on_query_update);
+
+                        // Callback run when the search filter is updated
+                        let on_filter_update = |search_filters: &TypeFilters| {
+                            let search_query = self.type_search.search_filter();
+                            update_type_list(search_query, search_filters);
+                        };
+                        self.type_filters.update(ui, &on_filter_update);
                         ui.separator();
                         ui.add_space(4.0);
 
@@ -681,6 +699,7 @@ impl ResymApp {
                                 false,
                                 false,
                                 self.settings.app_settings.ignore_std_types,
+                                Default::default(),
                             )) {
                                 log::error!("Failed to update type filter value: {}", err);
                             }
@@ -734,6 +753,7 @@ impl ResymApp {
                                     false,
                                     false,
                                     self.settings.app_settings.ignore_std_types,
+                                    Default::default(),
                                 ))
                             {
                                 log::error!("Failed to update type filter value: {}", err);

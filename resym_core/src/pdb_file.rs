@@ -26,8 +26,21 @@ use crate::{
 
 // Type
 pub type TypeIndex = u32;
+/// Minimal symbol info (used by frontends)
 pub type TypeInfo = (String, TypeIndex);
 pub type TypeList = Vec<TypeInfo>;
+/// Extended symbol info (used by the backend)
+pub type TypeInfoEx = (String, TypeIndex, TypeKind);
+pub type TypeListEx = Vec<TypeInfoEx>;
+pub type TypeListExView<'t> = Vec<&'t TypeInfoEx>;
+#[derive(Eq, PartialEq)]
+pub enum TypeKind {
+    Class,
+    Union,
+    Enum,
+    Unknown,
+}
+
 // Symbol
 /// `SymbolIndex` have two parts: a module index and a symbol index
 pub type SymbolIndex = (ModuleIndex, u32);
@@ -45,6 +58,7 @@ pub enum SymbolKind {
     Type,
     Unknown,
 }
+
 // Module
 pub type ModuleIndex = usize;
 pub type ModuleInfo = (String, ModuleIndex);
@@ -105,7 +119,7 @@ pub struct PdbFile<'p, T>
 where
     T: io::Seek + io::Read + 'p,
 {
-    pub complete_type_list: Vec<(String, TypeIndex)>,
+    pub complete_type_list: TypeListEx,
     pub forwarder_to_complete_type: Arc<DashMap<pdb::TypeIndex, pdb::TypeIndex>>,
     pub symbol_list: SymbolListEx,
     pub machine_type: pdb::MachineType,
@@ -246,7 +260,8 @@ where
                         if is_unnamed_type(&class_name) {
                             class_name = format!("_unnamed_{type_index}");
                         }
-                        self.complete_type_list.push((class_name, type_index.0));
+                        self.complete_type_list
+                            .push((class_name, type_index.0, TypeKind::Class));
                     }
                     pdb::TypeData::Union(data) => {
                         let mut class_name = data.name.to_string().into_owned();
@@ -262,7 +277,8 @@ where
                         if is_unnamed_type(&class_name) {
                             class_name = format!("_unnamed_{type_index}");
                         }
-                        self.complete_type_list.push((class_name, type_index.0));
+                        self.complete_type_list
+                            .push((class_name, type_index.0, TypeKind::Union));
                     }
                     pdb::TypeData::Enumeration(data) => {
                         let mut class_name = data.name.to_string().into_owned();
@@ -278,7 +294,8 @@ where
                         if is_unnamed_type(&class_name) {
                             class_name = format!("_unnamed_{type_index}");
                         }
-                        self.complete_type_list.push((class_name, type_index.0));
+                        self.complete_type_list
+                            .push((class_name, type_index.0, TypeKind::Enum));
                     }
                     _ => {}
                 }
@@ -433,6 +450,10 @@ where
             integers_as_hexadecimal,
             ignore_std_types,
         )
+    }
+
+    pub fn type_list(&self) -> TypeListExView {
+        self.complete_type_list.iter().collect()
     }
 
     pub fn symbol_list(&mut self) -> Result<SymbolListExView> {
@@ -1057,7 +1078,7 @@ where
 
     fn type_list_from_type_indices(&self, type_indices: &[TypeIndex]) -> TypeList {
         par_iter_if_available!(self.complete_type_list)
-            .filter_map(|(type_name, type_index)| {
+            .filter_map(|(type_name, type_index, _)| {
                 if type_indices.contains(type_index) {
                     Some((type_name.clone(), *type_index))
                 } else {
