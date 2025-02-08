@@ -1,3 +1,4 @@
+use bevy_reflect::Reflect;
 use crossbeam_channel::{Receiver, Sender};
 #[cfg(target_arch = "wasm32")]
 use instant::Instant;
@@ -7,6 +8,8 @@ use rayon::{
     prelude::ParallelSliceMut,
     ThreadPool,
 };
+#[cfg(all(not(feature = "rayon"), target_arch = "wasm32"))]
+use wasm_thread::{self as thread, JoinHandle};
 
 use core::fmt;
 #[cfg(all(not(feature = "rayon"), not(target_arch = "wasm32")))]
@@ -18,15 +21,16 @@ use std::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use std::{path::PathBuf, time::Instant};
-#[cfg(all(not(feature = "rayon"), target_arch = "wasm32"))]
-use wasm_thread::{self as thread, JoinHandle};
 
 use crate::{
     diffing::{diff_module_by_path, diff_symbol_by_name, diff_type_by_name},
     error::{Result, ResymCoreError},
     frontend::{FrontendCommand, FrontendController, ReconstructedType},
     par_iter_if_available, par_sort_by_if_available,
-    pdb_file::{self, ModuleList, PDBDataSource, PdbFile, SymbolList, SymbolListView, TypeList},
+    pdb_file::{
+        self, ModuleInfo, ModuleList, PDBDataSource, PdbFile, SymbolInfoEx, SymbolKind, SymbolList,
+        SymbolListExView, TypeInfoEx, TypeKind, TypeList, TypeListExView,
+    },
     pdb_types::{include_headers_for_flavor, PrimitiveReconstructionFlavor},
     PKG_VERSION,
 };
@@ -78,16 +82,16 @@ pub enum BackendCommand {
         bool,
     ),
     /// Retrieve a list of types that match the given filter for a given PDB.
-    ListTypes(PDBSlot, String, bool, bool, bool),
+    ListTypes(PDBSlot, String, bool, bool, bool, TypeFilters),
     /// Retrieve a list of types that match the given filter for multiple PDBs
     /// and merge the result.
-    ListTypesMerged(Vec<PDBSlot>, String, bool, bool, bool),
+    ListTypesMerged(Vec<PDBSlot>, String, bool, bool, bool, TypeFilters),
     /// Retrieve a list of symbols that match the given filter for multiple PDBs
     /// and merge the result.
-    ListSymbols(PDBSlot, String, bool, bool, bool),
+    ListSymbols(PDBSlot, String, bool, bool, bool, SymbolFilters),
     /// Retrieve a list of symbols that match the given filter for multiple PDBs
     /// and merge the result.
-    ListSymbolsMerged(Vec<PDBSlot>, String, bool, bool, bool),
+    ListSymbolsMerged(Vec<PDBSlot>, String, bool, bool, bool, SymbolFilters),
     /// Reconstruct a symbol given its index for a given PDB.
     ReconstructSymbolByIndex(
         PDBSlot,
@@ -137,6 +141,42 @@ pub enum BackendCommand {
     ),
     /// Retrieve a list of all types that reference the given type
     ListTypeCrossReferences(PDBSlot, pdb_file::TypeIndex),
+}
+
+/// Search filters for types
+#[derive(Clone, Reflect)]
+pub struct TypeFilters {
+    classes: bool,
+    unions: bool,
+    enums: bool,
+}
+
+impl Default for TypeFilters {
+    fn default() -> Self {
+        Self {
+            classes: true,
+            unions: true,
+            enums: true,
+        }
+    }
+}
+
+/// Search filters for symbols
+#[derive(Clone, Reflect)]
+pub struct SymbolFilters {
+    functions: bool,
+    variables: bool,
+    types: bool,
+}
+
+impl Default for SymbolFilters {
+    fn default() -> Self {
+        Self {
+            functions: true,
+            variables: true,
+            types: true,
+        }
+    }
 }
 
 /// Struct that represents the backend. The backend is responsible
@@ -394,19 +434,21 @@ fn worker_thread_routine(
 
             BackendCommand::ListTypes(
                 pdb_slot,
-                search_filter,
+                search_query,
                 case_insensitive_search,
                 use_regex,
                 ignore_std_types,
+                search_filters,
             ) => {
                 if let Some(pdb_file) = pdb_files.get(&pdb_slot) {
                     let filtered_type_list = update_type_filter_command(
                         pdb_file,
-                        &search_filter,
+                        &search_query,
                         case_insensitive_search,
                         use_regex,
                         ignore_std_types,
                         true,
+                        search_filters,
                     );
                     frontend_controller
                         .send_command(FrontendCommand::ListTypesResult(filtered_type_list))?;
@@ -415,21 +457,23 @@ fn worker_thread_routine(
 
             BackendCommand::ListTypesMerged(
                 pdb_slots,
-                search_filter,
+                search_query,
                 case_insensitive_search,
                 use_regex,
                 ignore_std_types,
+                search_filters,
             ) => {
                 let mut filtered_type_set = BTreeSet::default();
                 for pdb_slot in pdb_slots {
                     if let Some(pdb_file) = pdb_files.get(&pdb_slot) {
                         let filtered_type_list = update_type_filter_command(
                             pdb_file,
-                            &search_filter,
+                            &search_query,
                             case_insensitive_search,
                             use_regex,
                             ignore_std_types,
                             false,
+                            search_filters.clone(),
                         );
                         filtered_type_set.extend(filtered_type_list.into_iter().map(|(s, _)| {
                             // Collapse all type indices to `default`. When merging
@@ -446,18 +490,20 @@ fn worker_thread_routine(
 
             BackendCommand::ListSymbols(
                 pdb_slot,
-                search_filter,
+                search_query,
                 case_insensitive_search,
                 use_regex,
                 ignore_std_types,
+                search_filters,
             ) => {
                 if let Some(pdb_file) = pdb_files.get_mut(&pdb_slot) {
                     let filtered_symbol_list = update_symbol_filter_command(
                         pdb_file,
-                        &search_filter,
+                        &search_query,
                         case_insensitive_search,
                         use_regex,
                         ignore_std_types,
+                        search_filters,
                     );
                     frontend_controller
                         .send_command(FrontendCommand::ListSymbolsResult(filtered_symbol_list))?;
@@ -466,20 +512,22 @@ fn worker_thread_routine(
 
             BackendCommand::ListSymbolsMerged(
                 pdb_slots,
-                search_filter,
+                search_query,
                 case_insensitive_search,
                 use_regex,
                 ignore_std_types,
+                search_filters,
             ) => {
                 let mut filtered_symbol_set = BTreeSet::default();
                 for pdb_slot in pdb_slots {
                     if let Some(pdb_file) = pdb_files.get_mut(&pdb_slot) {
                         let filtered_symbol_list = update_symbol_filter_command(
                             pdb_file,
-                            &search_filter,
+                            &search_query,
                             case_insensitive_search,
                             use_regex,
                             ignore_std_types,
+                            search_filters.clone(),
                         );
                         filtered_symbol_set.extend(filtered_symbol_list.into_iter().map(
                             |(s, _)| {
@@ -891,33 +939,41 @@ where
 
 fn update_type_filter_command<T>(
     pdb_file: &PdbFile<T>,
-    search_filter: &str,
+    search_query: &str,
     case_insensitive_search: bool,
     use_regex: bool,
     ignore_std_types: bool,
     sort_by_index: bool,
+    search_filters: TypeFilters,
 ) -> TypeList
 where
-    T: io::Seek + io::Read,
+    T: io::Seek + io::Read + std::fmt::Debug,
 {
     let filter_start = Instant::now();
 
-    // Filter out std types if needed
-    let filtered_type_list = if ignore_std_types {
-        filter_std_types(&pdb_file.complete_type_list)
-    } else {
-        pdb_file.complete_type_list.clone()
-    };
+    // Retrieve view to the type list
+    let type_list: TypeListExView = pdb_file.type_list();
 
     // Filter types following the search filter
-    let mut filtered_type_list = if search_filter.is_empty() {
+    let filtered_type_list = if search_query.is_empty() {
         // No need to filter
-        filtered_type_list
+        type_list
     } else if use_regex {
-        filter_types_regex(&filtered_type_list, search_filter, case_insensitive_search)
+        filter_types_regex(&type_list, search_query, case_insensitive_search)
     } else {
-        filter_types_regular(&filtered_type_list, search_filter, case_insensitive_search)
+        filter_types_regular(&type_list, search_query, case_insensitive_search)
     };
+
+    // Apply filters by type kind
+    let filtered_type_list = filter_types_kind(&filtered_type_list, &search_filters);
+
+    // Filter out std types if needed
+    let mut filtered_type_list = if ignore_std_types {
+        filter_std_types(&filtered_type_list)
+    } else {
+        filtered_type_list
+    };
+
     if sort_by_index {
         // Order types by type index, so the order is deterministic
         // (i.e., independent from DashMap's hash function)
@@ -929,15 +985,18 @@ where
         filter_start.elapsed().as_millis()
     );
 
-    filtered_type_list
+    // Convert refs to symbol info into clones and return it
+    par_iter_if_available!(filtered_type_list)
+        .map(|type_info| (type_info.0.clone(), type_info.1))
+        .collect()
 }
 
 /// Filter type list with a regular expression
-fn filter_types_regex(
-    type_list: &[(String, u32)],
+fn filter_types_regex<'s>(
+    type_list: &'s [&TypeInfoEx],
     search_filter: &str,
     case_insensitive_search: bool,
-) -> TypeList {
+) -> TypeListExView<'s> {
     match regex::RegexBuilder::new(search_filter)
         .case_insensitive(case_insensitive_search)
         .build()
@@ -952,11 +1011,11 @@ fn filter_types_regex(
 }
 
 /// Filter type list with a plain (sub-)string
-fn filter_types_regular(
-    type_list: &[(String, u32)],
+fn filter_types_regular<'s>(
+    type_list: &'s [&TypeInfoEx],
     search_filter: &str,
     case_insensitive_search: bool,
-) -> TypeList {
+) -> TypeListExView<'s> {
     if case_insensitive_search {
         let search_filter = search_filter.to_lowercase();
         par_iter_if_available!(type_list)
@@ -972,19 +1031,42 @@ fn filter_types_regular(
 }
 
 /// Filter type list to remove types in the `std` namespace
-fn filter_std_types(type_list: &[(String, pdb_file::TypeIndex)]) -> TypeList {
+fn filter_std_types<'s>(type_list: &'s [&TypeInfoEx]) -> TypeListExView<'s> {
     par_iter_if_available!(type_list)
         .filter(|r| !r.0.starts_with("std::"))
         .cloned()
         .collect()
 }
 
+/// Filter type list with a regular expression
+#[allow(clippy::if_same_then_else, clippy::needless_bool)]
+fn filter_types_kind<'s>(
+    type_list: &'s [&TypeInfoEx],
+    type_filters: &TypeFilters,
+) -> TypeListExView<'s> {
+    par_iter_if_available!(type_list)
+        .filter(|(_, _, type_kind)| {
+            if !type_filters.classes && *type_kind == TypeKind::Class {
+                false
+            } else if !type_filters.unions && *type_kind == TypeKind::Union {
+                false
+            } else if !type_filters.enums && *type_kind == TypeKind::Enum {
+                false
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 fn update_symbol_filter_command<T>(
     pdb_file: &mut PdbFile<T>,
-    search_filter: &str,
+    search_query: &str,
     case_insensitive_search: bool,
     use_regex: bool,
     ignore_std_symbols: bool,
+    search_filters: SymbolFilters,
 ) -> SymbolList
 where
     T: io::Seek + io::Read + fmt::Debug,
@@ -992,30 +1074,25 @@ where
     let filter_start = Instant::now();
 
     match pdb_file.symbol_list() {
-        Err(_) => SymbolList::default(),
+        Err(_) => Default::default(),
         Ok(symbol_list) => {
-            // Filter out std types if needed
-            let filtered_symbol_list = if ignore_std_symbols {
-                filter_std_symbols(&symbol_list)
-            } else {
+            let filtered_symbol_list = if search_query.is_empty() {
+                // No need to filter
                 symbol_list
+            } else if use_regex {
+                filter_symbols_regex(&symbol_list, search_query, case_insensitive_search)
+            } else {
+                filter_symbols_regular(&symbol_list, search_query, case_insensitive_search)
             };
 
-            let filtered_symbol_list = if search_filter.is_empty() {
-                // No need to filter
-                filtered_symbol_list
-            } else if use_regex {
-                filter_symbols_regex(
-                    &filtered_symbol_list,
-                    search_filter,
-                    case_insensitive_search,
-                )
+            // Apply filters by symbol kind
+            let filtered_symbol_list = filter_symbols_type(&filtered_symbol_list, &search_filters);
+
+            // Filter out std types if needed
+            let filtered_symbol_list = if ignore_std_symbols {
+                filter_std_symbols(&filtered_symbol_list)
             } else {
-                filter_symbols_regular(
-                    &filtered_symbol_list,
-                    search_filter,
-                    case_insensitive_search,
-                )
+                filtered_symbol_list
             };
 
             log::debug!(
@@ -1025,28 +1102,26 @@ where
 
             // Convert refs to symbol info into clones and return it
             par_iter_if_available!(filtered_symbol_list)
-                .map(|e| (e.0.clone(), e.1))
+                .map(|symbol_info| (symbol_info.0.clone(), symbol_info.1))
                 .collect()
         }
     }
 }
 
 /// Filter symbol list to remove types in the `std` namespace
-fn filter_std_symbols<'s>(
-    symbol_list: &'s [&(String, pdb_file::SymbolIndex)],
-) -> SymbolListView<'s> {
+fn filter_std_symbols<'s>(symbol_list: &'s [&SymbolInfoEx]) -> SymbolListExView<'s> {
     par_iter_if_available!(symbol_list)
         .filter(|r| !r.0.starts_with("std::"))
         .cloned()
         .collect()
 }
 
-/// Filter type list with a regular expression
+/// Filter symbol list with a regular expression
 fn filter_symbols_regex<'s>(
-    symbol_list: &'s [&(String, pdb_file::SymbolIndex)],
+    symbol_list: &'s [&SymbolInfoEx],
     search_filter: &str,
     case_insensitive_search: bool,
-) -> SymbolListView<'s> {
+) -> SymbolListExView<'s> {
     match regex::RegexBuilder::new(search_filter)
         .case_insensitive(case_insensitive_search)
         .build()
@@ -1060,12 +1135,12 @@ fn filter_symbols_regex<'s>(
     }
 }
 
-/// Filter type list with a plain (sub-)string
+/// Filter symbol list with a plain (sub-)string
 fn filter_symbols_regular<'s>(
-    symbol_list: &'s [&(String, pdb_file::SymbolIndex)],
+    symbol_list: &'s [&SymbolInfoEx],
     search_filter: &str,
     case_insensitive_search: bool,
-) -> SymbolListView<'s> {
+) -> SymbolListExView<'s> {
     if case_insensitive_search {
         let search_filter = search_filter.to_lowercase();
         par_iter_if_available!(symbol_list)
@@ -1078,6 +1153,28 @@ fn filter_symbols_regular<'s>(
             .cloned()
             .collect()
     }
+}
+
+/// Filter symbol list by type
+#[allow(clippy::if_same_then_else, clippy::needless_bool)]
+fn filter_symbols_type<'s>(
+    symbol_list: &'s [&SymbolInfoEx],
+    symbol_filters: &SymbolFilters,
+) -> SymbolListExView<'s> {
+    par_iter_if_available!(symbol_list)
+        .filter(|(_, _, symbol_kind)| {
+            if !symbol_filters.functions && *symbol_kind == SymbolKind::Function {
+                false
+            } else if !symbol_filters.variables && *symbol_kind == SymbolKind::Variable {
+                false
+            } else if !symbol_filters.types && *symbol_kind == SymbolKind::Type {
+                false
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect()
 }
 
 fn list_modules_command<'p, T>(
@@ -1118,10 +1215,10 @@ where
 
 /// Filter module list with a regular expression
 fn filter_modules_regex(
-    module_list: &[(String, usize)],
+    module_list: &[ModuleInfo],
     search_filter: &str,
     case_insensitive_search: bool,
-) -> Vec<(String, usize)> {
+) -> ModuleList {
     match regex::RegexBuilder::new(search_filter)
         .case_insensitive(case_insensitive_search)
         .build()
@@ -1137,10 +1234,10 @@ fn filter_modules_regex(
 
 /// Filter module list with a plain (sub-)string
 fn filter_modules_regular(
-    module_list: &[(String, usize)],
+    module_list: &[ModuleInfo],
     search_filter: &str,
     case_insensitive_search: bool,
-) -> Vec<(String, usize)> {
+) -> ModuleList {
     if case_insensitive_search {
         let search_filter = search_filter.to_lowercase();
         par_iter_if_available!(module_list)
