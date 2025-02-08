@@ -24,14 +24,31 @@ use crate::{
     },
 };
 
+// Type
 pub type TypeIndex = u32;
-pub type TypeList = Vec<(String, TypeIndex)>;
+pub type TypeInfo = (String, TypeIndex);
+pub type TypeList = Vec<TypeInfo>;
+// Symbol
 /// `SymbolIndex` have two parts: a module index and a symbol index
 pub type SymbolIndex = (ModuleIndex, u32);
-pub type SymbolList = Vec<(String, SymbolIndex)>;
-pub type SymbolListView<'t> = Vec<&'t (String, SymbolIndex)>;
+/// Minimal symbol info (used by frontends)
+pub type SymbolInfo = (String, SymbolIndex);
+pub type SymbolList = Vec<SymbolInfo>;
+/// Extended symbol info (used by the backend)
+pub type SymbolInfoEx = (String, SymbolIndex, SymbolKind);
+pub type SymbolListEx = Vec<SymbolInfoEx>;
+pub type SymbolListExView<'t> = Vec<&'t SymbolInfoEx>;
+#[derive(Eq, PartialEq)]
+pub enum SymbolKind {
+    Function,
+    Variable,
+    Type,
+    Unknown,
+}
+// Module
 pub type ModuleIndex = usize;
-pub type ModuleList = Vec<(String, ModuleIndex)>;
+pub type ModuleInfo = (String, ModuleIndex);
+pub type ModuleList = Vec<ModuleInfo>;
 
 const GLOBAL_MODULE_INDEX: usize = usize::MAX;
 
@@ -67,8 +84,9 @@ impl Read for PDBDataSource {
 #[derive(PartialEq, Eq)]
 struct PrioritizedSymbol {
     priority: u16,
-    index: SymbolIndex,
     name: String,
+    index: SymbolIndex,
+    kind: SymbolKind,
 }
 
 impl PartialOrd for PrioritizedSymbol {
@@ -89,7 +107,7 @@ where
 {
     pub complete_type_list: Vec<(String, TypeIndex)>,
     pub forwarder_to_complete_type: Arc<DashMap<pdb::TypeIndex, pdb::TypeIndex>>,
-    pub symbol_list: SymbolList,
+    pub symbol_list: SymbolListEx,
     pub machine_type: pdb::MachineType,
     pub type_information: pdb::TypeInformation<'p>,
     pub debug_information: pdb::DebugInformation<'p>,
@@ -417,7 +435,7 @@ where
         )
     }
 
-    pub fn symbol_list(&mut self) -> Result<SymbolListView> {
+    pub fn symbol_list(&mut self) -> Result<SymbolListExView> {
         // If cache is populated, return the cached list
         if !self.symbol_list.is_empty() {
             return Ok(self.symbol_list.iter().collect());
@@ -439,12 +457,15 @@ where
 
                 let mut module_symbols = module_info.symbols()?;
                 while let Some(symbol) = module_symbols.next()? {
-                    if let Some(symbol_name) = get_symbol_name(&symbol) {
-                        symbol_heap.push(PrioritizedSymbol {
-                            priority: symbol_priority(&symbol),
-                            index: (module_index, symbol.index().0),
-                            name: symbol_name.clone(),
-                        });
+                    if let Ok(symbol_data) = symbol.parse() {
+                        if let Some(symbol_name) = get_symbol_name(&symbol_data) {
+                            symbol_heap.push(PrioritizedSymbol {
+                                priority: symbol_priority(&symbol_data),
+                                name: symbol_name.clone(),
+                                index: (module_index, symbol.index().0),
+                                kind: get_symbol_type(&symbol_data),
+                            });
+                        }
                     }
                 }
             }
@@ -453,12 +474,15 @@ where
         // Global symbols
         let mut symbol_table = self.global_symbols.iter();
         while let Some(symbol) = symbol_table.next()? {
-            if let Some(symbol_name) = get_symbol_name(&symbol) {
-                symbol_heap.push(PrioritizedSymbol {
-                    priority: symbol_priority(&symbol),
-                    index: (GLOBAL_MODULE_INDEX, symbol.index().0),
-                    name: symbol_name.clone(),
-                });
+            if let Ok(symbol_data) = symbol.parse() {
+                if let Some(symbol_name) = get_symbol_name(&symbol_data) {
+                    symbol_heap.push(PrioritizedSymbol {
+                        priority: symbol_priority(&symbol_data),
+                        name: symbol_name.clone(),
+                        index: (GLOBAL_MODULE_INDEX, symbol.index().0),
+                        kind: get_symbol_type(&symbol_data),
+                    });
+                }
             }
         }
 
@@ -470,7 +494,8 @@ where
             .filter_map(|s| {
                 if !symbol_names.contains(&s.name) {
                     symbol_names.insert(s.name.clone());
-                    Some((s.name, s.index))
+
+                    Some((s.name, s.index, s.kind))
                 } else {
                     None
                 }
@@ -565,16 +590,18 @@ where
         // Global symbols
         let mut symbol_table = self.global_symbols.iter();
         while let Some(symbol) = symbol_table.next()? {
-            if let Some(current_symbol_name) = get_symbol_name(&symbol) {
-                if current_symbol_name == symbol_name {
-                    return Ok(self
-                        .reconstruct_symbol(
-                            &type_finder,
-                            &symbol,
-                            primitives_flavor,
-                            print_access_specifiers,
-                        )
-                        .unwrap_or_default());
+            if let Ok(symbol_data) = symbol.parse() {
+                if let Some(current_symbol_name) = get_symbol_name(&symbol_data) {
+                    if current_symbol_name == symbol_name {
+                        return Ok(self
+                            .reconstruct_symbol(
+                                &type_finder,
+                                &symbol,
+                                primitives_flavor,
+                                print_access_specifiers,
+                            )
+                            .unwrap_or_default());
+                    }
                 }
             }
         }
@@ -587,16 +614,18 @@ where
                 if let Some(module_info) = pdb.module_info(&module)? {
                     let mut module_symbols = module_info.symbols()?;
                     while let Some(symbol) = module_symbols.next()? {
-                        if let Some(current_symbol_name) = get_symbol_name(&symbol) {
-                            if current_symbol_name == symbol_name {
-                                return Ok(self
-                                    .reconstruct_symbol(
-                                        &type_finder,
-                                        &symbol,
-                                        primitives_flavor,
-                                        print_access_specifiers,
-                                    )
-                                    .unwrap_or_default());
+                        if let Ok(symbol_data) = symbol.parse() {
+                            if let Some(current_symbol_name) = get_symbol_name(&symbol_data) {
+                                if current_symbol_name == symbol_name {
+                                    return Ok(self
+                                        .reconstruct_symbol(
+                                            &type_finder,
+                                            &symbol,
+                                            primitives_flavor,
+                                            print_access_specifiers,
+                                        )
+                                        .unwrap_or_default());
+                                }
                             }
                         }
                     }
@@ -629,14 +658,16 @@ where
         // Global symbols
         let mut symbol_table = self.global_symbols.iter();
         while let Some(symbol) = symbol_table.next()? {
-            if get_symbol_name(&symbol).is_some() {
-                if let Some(reconstructed_symbol) = self.reconstruct_symbol(
-                    &type_finder,
-                    &symbol,
-                    primitives_flavor,
-                    print_access_specifiers,
-                ) {
-                    writeln!(&mut reconstruction_output, "{}", reconstructed_symbol)?;
+            if let Ok(symbol_data) = symbol.parse() {
+                if get_symbol_name(&symbol_data).is_some() {
+                    if let Some(reconstructed_symbol) = self.reconstruct_symbol(
+                        &type_finder,
+                        &symbol,
+                        primitives_flavor,
+                        print_access_specifiers,
+                    ) {
+                        writeln!(&mut reconstruction_output, "{}", reconstructed_symbol)?;
+                    }
                 }
             }
         }
@@ -649,14 +680,20 @@ where
                 if let Some(module_info) = pdb.module_info(&module)? {
                     let mut module_symbols = module_info.symbols()?;
                     while let Some(symbol) = module_symbols.next()? {
-                        if get_symbol_name(&symbol).is_some() {
-                            if let Some(reconstructed_symbol) = self.reconstruct_symbol(
-                                &type_finder,
-                                &symbol,
-                                primitives_flavor,
-                                print_access_specifiers,
-                            ) {
-                                writeln!(&mut reconstruction_output, "{}", reconstructed_symbol)?;
+                        if let Ok(symbol_data) = symbol.parse() {
+                            if get_symbol_name(&symbol_data).is_some() {
+                                if let Some(reconstructed_symbol) = self.reconstruct_symbol(
+                                    &type_finder,
+                                    &symbol,
+                                    primitives_flavor,
+                                    print_access_specifiers,
+                                ) {
+                                    writeln!(
+                                        &mut reconstruction_output,
+                                        "{}",
+                                        reconstructed_symbol
+                                    )?;
+                                }
                             }
                         }
                     }
@@ -1236,11 +1273,11 @@ fn compute_type_depth_map(
     inverted_type_depth_map
 }
 
-fn get_symbol_name(symbol: &pdb::Symbol) -> Option<String> {
+fn get_symbol_name(symbol_data: &pdb::SymbolData) -> Option<String> {
     const UNNAMED_CONSTANT_PREFIXES: [&str; 5] = ["`", "??_", "__@@_PchSym_", "__real@", "__xmm@"];
     const UNNAMED_CONSTANT_SUFFIXES: [&str; 1] = ["@@9@9"];
 
-    match symbol.parse().ok()? {
+    match symbol_data {
         pdb::SymbolData::UserDefinedType(udt) => Some(udt.name.to_string().to_string()),
 
         // Functions and methods
@@ -1275,6 +1312,38 @@ fn get_symbol_name(symbol: &pdb::Symbol) -> Option<String> {
 
         true
     })
+}
+
+fn get_symbol_type(symbol_data: &pdb::SymbolData) -> SymbolKind {
+    match symbol_data {
+        pdb::SymbolData::UserDefinedType(_) => SymbolKind::Type,
+
+        // Functions and methods
+        pdb::SymbolData::Procedure(_) => SymbolKind::Function,
+
+        // Global variables
+        pdb::SymbolData::Data(_) => SymbolKind::Variable,
+
+        // Public symbols
+        pdb::SymbolData::Public(data) => {
+            if data.function {
+                SymbolKind::Function
+            } else {
+                SymbolKind::Variable
+            }
+        }
+
+        // Exported symbols
+        pdb::SymbolData::Export(data) => {
+            if data.flags.data {
+                SymbolKind::Variable
+            } else {
+                SymbolKind::Function
+            }
+        }
+
+        _ => SymbolKind::Unknown,
+    }
 }
 
 fn symbol_rva(
@@ -1314,20 +1383,16 @@ fn demangle_symbol_name(
         .ok()
 }
 
-fn symbol_priority(symbol: &pdb::Symbol) -> u16 {
-    if let Ok(symbol) = symbol.parse() {
-        match symbol {
-            // Functions and methods, user types, global variables
-            pdb::SymbolData::Procedure(_)
-            | pdb::SymbolData::UserDefinedType(_)
-            | pdb::SymbolData::Data(_) => 0,
-            // Public symbols
-            pdb::SymbolData::Public(_) => 1,
-            // Exported symbols
-            pdb::SymbolData::Export(_) => 2,
-            _ => 10,
-        }
-    } else {
-        0
+fn symbol_priority(symbol_data: &pdb::SymbolData) -> u16 {
+    match symbol_data {
+        // Functions and methods, user types, global variables
+        pdb::SymbolData::Procedure(_)
+        | pdb::SymbolData::UserDefinedType(_)
+        | pdb::SymbolData::Data(_) => 0,
+        // Public symbols
+        pdb::SymbolData::Public(_) => 1,
+        // Exported symbols
+        pdb::SymbolData::Export(_) => 2,
+        _ => 10,
     }
 }
